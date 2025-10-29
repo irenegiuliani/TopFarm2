@@ -106,7 +106,7 @@ class economic_evaluation():
         # %% BOP  [Euro] (Balance of Plant costs)
 
         myName = "BOP"
-        IA_cable_lenght = network_length #cabling_cost / 750 #[m]
+        IA_cable_lenght = network_length #[m]
         C_IATS = 91000      #[€/day] cost of Cable Laying Vessel
         C_EXTS = 114000     #[€/day] cost of Cable Laying Vessel
         k_ITS = 1080         #[m/day] installation rate of the electric cable
@@ -116,8 +116,7 @@ class economic_evaluation():
         k_anch = 1          #[m/day] installation rate of the electric cable
 
         self.project_costs[myName] = {
-            # "substation": 6.0e6 + 1.0e4 * np.sum(rated_power) ** 1.5,
-            "substation": 200000000,
+            "substation": 6.0e6 + 1.0e4 * np.sum(rated_power) ** 1.5,
             "array_of_cables": 3.5e3 * np.sum(rotor_diameter),
             "array_of_cables_installation": C_IATS / k_ITS * IA_cable_lenght[0],
             "cables_export": self.var_cable_cost * self.distance_from_shore,
@@ -134,7 +133,7 @@ class economic_evaluation():
         # %% CAPEX [Euro]
 
         self.project_costs_sums["CAPEX"] = sum(self.turbine_general_costs_sums["TOTAL"]) + sum(self.foundation_general_costs_sums["TOTAL"]) + self.project_costs_sums["BOP"]
-        # self.project_costs_sums["CAPEX"] = self.turbine_general_costs_sums["TOTAL"] + sum(self.foundation_general_costs_sums["TOTAL"]) + self.project_costs_sums["BOP"]
+
     def calculate_opex(self, rated_power):
         ''' Calculate OPEX [Euro / year]'''
 
@@ -331,9 +330,8 @@ class economic_evaluation():
 
         # %% Turbine Total Cost
 
-        # self.turbine_general_costs_sums["TOTAL"] = self.turbine_general_costs_sums["total_production"] + \
-        #     self.turbine_general_costs_sums["project"]
-        self.turbine_general_costs_sums["TOTAL"] = np.array([23000000] * 39)
+        self.turbine_general_costs_sums["TOTAL"] = self.turbine_general_costs_sums["total_production"] + \
+            self.turbine_general_costs_sums["project"]
 
 
     # %% Foundation        
@@ -351,8 +349,7 @@ class economic_evaluation():
             "semi_sub": 0.00875674 * pit_moment -1157984.95823864}
 
         self.foundation_costs = {
-            # "semi_sub": 2.14308834 * self.foundation_mass['semi_sub'] + 7689597.24562343}
-            "semi_sub": np.array([28000000] * 39) }
+            "semi_sub": 2.14308834 * self.foundation_mass['semi_sub'] + 7689597.24562343}
                 
         self.foundation_mass_sum = sum(self.foundation_mass.values())
         self.foundation_cost_sum = sum(self.foundation_costs.values())
@@ -371,10 +368,8 @@ class economic_evaluation():
             "material_overhead": 0.1 *
             self.foundation_general_costs_sums["bill_of_material"]}
 
-        # self.foundation_general_costs_sums[myName] = sum(self.foundation_general_costs[myName].values(
-        # )) + self.foundation_general_costs_sums["bill_of_material"]
-        self.foundation_general_costs_sums[myName] = self.foundation_general_costs_sums["bill_of_material"]
-
+        self.foundation_general_costs_sums[myName] = sum(self.foundation_general_costs[myName].values(
+        )) + self.foundation_general_costs_sums["bill_of_material"]
 
         # %% Foundation Selling, General and Administrative Expenses (SG&A)
 
@@ -387,7 +382,7 @@ class economic_evaluation():
 
         self.foundation_general_costs_sums[myName] = sum(
             self.foundation_general_costs[myName].values())
-        # self.foundation_general_costs_sums[myName] = 0
+        
         # %% moorings and anchors
 
         myName = "moorings_anchoring"
@@ -395,16 +390,13 @@ class economic_evaluation():
         MBL = 20156 #[kN] minimum breaking load
         n_moor = 3  #moorings per platform
 
-        # self.foundation_general_costs[myName] = {
-        #     "moorings": np.full(39, moorings_cost/39),
-        #     "anchoring": np.full(39, anchoring_cost/39),
-        #     }
         self.foundation_general_costs[myName] = {
             "moorings": moorings_cost,
             "anchoring": anchoring_cost,
             }
         
         self.foundation_general_costs_sums[myName] = sum(self.foundation_general_costs[myName].values())
+
 
         # %% Foundation Total Production Cost
 
@@ -433,7 +425,7 @@ class economic_evaluation():
         # %% Foundation Total Cost
 
         self.foundation_general_costs_sums["TOTAL"] = self.foundation_general_costs_sums[
-            "direct_production"] + self.foundation_general_costs_sums["moorings_anchoring"]
+            "total_production"] + self.foundation_general_costs_sums["project"]
 
     def high_speed_drivetrain(self, rotor_diameter, rated_torque, rated_rpm):
         '''Calculate the cost of high speed drivetrain [Euro]'''

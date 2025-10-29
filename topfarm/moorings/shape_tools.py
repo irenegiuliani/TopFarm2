@@ -1,6 +1,7 @@
-import os
 import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import os
+sys.path.append(r'D:\Giuliani\Projects\NADARA\Topfarm')
+sys.path.append(r'D:\Giuliani\Projects\NADARA\Tool')
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -303,6 +304,243 @@ def generate_seabed_gdf(gdb_path,
 #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 #     seabed_gdf.to_file(output_path)
 #     return seabed_gdf
+
+
+def process_seabed_layers_from_list(
+    seabed_layers_info,
+    output_path,
+    epsg=32634
+):
+    """
+    Processes and merges seabed layers from multiple spatial data sources (GeoDatabase or Shapefile)
+    into a unified GeoDataFrame, applying optional buffers, coordinate system harmonization, 
+    and area computation for each seabed category.
+
+    This function is designed to flexibly handle multiple seabed data inputs provided as a list of
+    dictionaries, where each entry may reference:
+    - a file geodatabase (.gdb) or geopackage (.gpkg) containing multiple layers, or
+    - a single shapefile (.shp).
+    
+    For each layer, attributes such as seabed type, maximum depth, and an optional buffer distance
+    can be specified. All geometries are reprojected to a common coordinate reference system (CRS),
+    merged by seabed type, and finally written to a single output shapefile.
+
+    Parameters
+    ----------
+    seabed_layers_info : list of dict
+        A list containing one dictionary for each data source to be processed. 
+        Each dictionary must include the following keys:
+        
+        - **path** (`str`): Path to the data source. Can be either:
+          - a *File Geodatabase* (`.gdb` or `.gpkg`) containing one or more layers, or
+          - a *Shapefile* (`.shp`).
+        
+        - **key_layers** (`list of str`, optional): Names of layers to be read from the GDB/GPKG.  
+          Required only if `path` points to a GDB or GPKG. Ignored for shapefiles.
+
+        - **seabed_type** (`list of str` or `str`): Seabed category (e.g., `'rock'`, `'sand'`, `'mud'`) 
+          to associate with each layer. If a list is provided, it must have the same length as `key_layers`.
+
+        - **max_depth** (`list of float` or `float`, optional): Maximum depth values (in meters) 
+          corresponding to each layer. Defaults to `0` for all layers if not provided.
+
+        - **add_buffer** (`list of float` or `float`, optional): Buffer distances (in meters) 
+          to apply around geometries for each layer. Defaults to `0` (no buffering).
+
+    output_path : str
+        Path where the combined shapefile will be saved. The directory will be recreated if it exists.
+        Example: `"C:/project/output/seabed_combined.shp"`
+
+    epsg : int, optional
+        EPSG code of the coordinate reference system (CRS) to which all layers are reprojected.
+        Default is `32634` (UTM Zone 34N).
+
+    Returns
+    -------
+    seabed_gdf : geopandas.GeoDataFrame
+        A unified GeoDataFrame containing all processed seabed features.
+        Columns:
+        - `'seabed'`: Seabed type (str)
+        - `'max_depth'`: Maximum depth associated with the seabed (float)
+        - `'name'`: Original layer or file name (str)
+        - `'geometry'`: Polygon or multipolygon geometry
+        - `'Shape_Area'`: Computed area of each polygon (float, CRS units)
+
+    Workflow
+    --------
+    1. **Input Parsing**:  
+       Iterates through the list of seabed sources (`seabed_layers_info`).
+       For each entry, determines if the source is a `.gdb`, `.gpkg`, or `.shp`.
+       
+    2. **Geometry Extraction**:  
+       Reads each specified layer into a GeoDataFrame, reprojects it to the target CRS,
+       and attaches metadata (`seabed`, `max_depth`, `Shape_Area`).
+
+    3. **Optional Buffering**:  
+       If a non-zero `add_buffer` value is provided, applies a buffer to each geometry
+       using the specified distance (in CRS units).
+
+    4. **Merging and Union**:  
+       Concatenates all individual GeoDataFrames and performs a geometric union for each
+       unique seabed type to create a single feature per category.
+
+    5. **Output Export**:  
+       The final unified GeoDataFrame is saved as a shapefile at `output_path`.
+
+    Notes
+    -----
+    - All input layers are automatically reprojected to the specified `epsg`.
+    - Buffer distances are applied in the same CRS units (e.g., meters for UTM projections).
+    - The output directory is recreated to ensure a clean save environment.
+    - The function is suitable for combining heterogeneous data sources (e.g., mixed GDB and shapefiles).
+
+    Examples
+    --------
+    >>> seabed_layers_info = [
+    ...     {
+    ...         "path": "data/seabed_zones.gdb",
+    ...         "key_layers": ["rock_zone", "sand_zone"],
+    ...         "seabed_type": ["rock", "sand"],
+    ...         "max_depth": [50, 30],
+    ...         "add_buffer": [0, 500]
+    ...     },
+    ...     {
+    ...         "path": "data/mud_area.shp",
+    ...         "seabed_type": "mud",
+    ...         "max_depth": 20,
+    ...         "add_buffer": 0
+    ...     }
+    ... ]
+    >>> output_path = "output/combined_seabed.shp"
+    >>> result_gdf = process_seabed_layers_from_list(seabed_layers_info, output_path, epsg=32633)
+    >>> result_gdf.head()
+           seabed  max_depth           name                 geometry  Shape_Area
+    0        rock       50.0    rock_zone_union  MULTIPOLYGON (...)    2.1e+06
+    1        sand       30.0    sand_zone_union  MULTIPOLYGON (...)    1.8e+06
+    2         mud       20.0     mud_area_union  MULTIPOLYGON (...)    0.9e+06
+    """
+    crs = CRS.from_epsg(epsg)
+    seabed_features = []
+    base_features = []
+
+    # --- Loop through all seabed layer definitions ---
+    for info in seabed_layers_info:
+        path = info['path']
+        layers = info.get('key_layers', None)
+        seabed_type = info['seabed_type']
+        max_depth = info.get('max_depth', None)
+        add_buffer = info.get('add_buffer', None)
+        is_base = info.get('is_base', None)
+
+        # Handle GDB/GPKG
+        if path.endswith(('.gdb', '.gpkg')):
+            if not layers:
+                raise ValueError(f"key_layers must be provided for GDB: {path}")
+
+            n_layers = len(layers)
+            max_depth = max_depth or [0] * n_layers
+            add_buffer = add_buffer or [0] * n_layers
+            is_base = is_base or [False] * n_layers
+
+            for i, layer in enumerate(layers):
+                gdf = gpd.read_file(path, layer=layer).to_crs(crs).copy()
+
+                gdf['seabed'] = seabed_type[i] if isinstance(seabed_type, list) else seabed_type
+                gdf['max_depth'] = max_depth[i]
+                gdf['name'] = layer
+                gdf['Shape_Area'] = gdf.geometry.area.round(1)
+
+                if add_buffer[i] != 0:
+                    gdf['geometry'] = gdf['geometry'].buffer(add_buffer[i])
+
+                if is_base[i]:
+                    base_features.append(gdf)
+                else:
+                    seabed_features.append(gdf)
+
+        # Handle shapefiles
+        elif path.endswith('.shp'):
+            gdf = gpd.read_file(path).to_crs(crs).copy()
+
+            gdf['seabed'] = seabed_type if not isinstance(seabed_type, list) else seabed_type[0]
+            gdf['max_depth'] = max_depth if not isinstance(max_depth, list) else max_depth[0]
+            gdf['name'] = os.path.splitext(os.path.basename(path))[0]
+            gdf['Shape_Area'] = gdf.geometry.area.round(1)
+
+            if add_buffer:
+                buffer_val = add_buffer if isinstance(add_buffer, (int, float)) else add_buffer[0]
+                if buffer_val != 0:
+                    gdf['geometry'] = gdf['geometry'].buffer(buffer_val)
+
+            if isinstance(is_base, list):
+                base_flag = is_base[0]
+            else:
+                base_flag = bool(is_base)
+
+            if base_flag:
+                base_features.append(gdf)
+            else:
+                seabed_features.append(gdf)
+
+    # --- Combine seabed layers ---
+    combined_gdf = (
+        gpd.GeoDataFrame(pd.concat(seabed_features, ignore_index=True), crs=crs)
+        if seabed_features else gpd.GeoDataFrame(columns=['geometry'], crs=crs)
+    )
+
+    # --- Compute base layer difference if exists ---
+    if base_features:
+        base_gdf = gpd.GeoDataFrame(pd.concat(base_features, ignore_index=True), crs=crs)
+        clip_union = combined_gdf.unary_union if not combined_gdf.empty else None
+
+        outside = base_gdf.copy()
+        if clip_union:
+            outside['geometry'] = base_gdf.geometry.difference(clip_union)
+        outside = outside[~outside.is_empty & outside.geometry.notnull()].copy()
+
+        outside['seabed'] = 'sand'
+        outside['max_depth'] = -9999
+        outside['name'] = 'outside_area'
+        outside['Shape_Area'] = outside.geometry.area.round(1)
+        seabed_features.append(outside)
+
+    # --- Merge everything ---
+    if seabed_features:
+        seabed_gdf = gpd.GeoDataFrame(pd.concat(seabed_features, ignore_index=True), crs=crs)
+    else:
+        seabed_gdf = gpd.GeoDataFrame(columns=['geometry'], crs=crs)
+
+    # --- Merge by seabed type ---
+    merged_layers = []
+    for stype in seabed_gdf['seabed'].unique():
+        sub_gdf = seabed_gdf[seabed_gdf['seabed'] == stype]
+        merged_geom = sub_gdf.unary_union
+        if merged_geom.geom_type == 'Polygon':
+            merged_geom = MultiPolygon([merged_geom])
+        elif merged_geom.geom_type == 'GeometryCollection':
+            merged_geom = MultiPolygon([
+                g for g in merged_geom.geoms if g.geom_type in ['Polygon', 'MultiPolygon']
+            ])
+
+        merged_layers.append(gpd.GeoDataFrame({
+            'seabed': stype,
+            'max_depth': [sub_gdf['max_depth'].iloc[0]],
+            'name': [stype + '_union'],
+            'geometry': [merged_geom],
+            'Shape_Area': [merged_geom.area]
+        }, crs=crs))
+
+    seabed_gdf = gpd.GeoDataFrame(pd.concat(merged_layers, ignore_index=True), crs=crs)
+
+    # --- Save output ---
+    output_dir = os.path.dirname(output_path)
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    seabed_gdf.to_file(output_path)
+
+    return seabed_gdf
+    
 
 
 def process_seabed_layers(

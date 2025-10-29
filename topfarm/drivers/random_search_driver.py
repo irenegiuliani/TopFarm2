@@ -18,6 +18,9 @@ class RandomSearchDriver(Driver):
         self.supports['integer_design_vars'] = True
 
         # What we don't support yet
+# The above code is setting the values of two keys in the `self.supports` dictionary to `False`. The
+# keys are `'inequality_constraints'` and `'equality_constraints'`, and their corresponding values are
+# being set to `False`.
         self.supports['inequality_constraints'] = False
         self.supports['equality_constraints'] = False
         self.supports['multiple_objectives'] = False
