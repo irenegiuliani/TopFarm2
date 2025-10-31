@@ -49,7 +49,8 @@ class economic_evaluation():
         
         CRF = (self.discount_rate*(1+self.discount_rate)**self.project_duration)/((1+self.discount_rate)**self.project_duration-1)
         
-        self.sLCOE = ((self.project_costs_sums["CAPEX"] + self.project_costs_sums["DEVEX"]) * CRF + self.project_costs_sums["OPEX"] + self.project_costs_sums["ABEX"]) / (sum(self.aep_vector)/1e03)
+        # self.sLCOE = ((self.project_costs_sums["CAPEX"] + self.project_costs_sums["DEVEX"]) * CRF + self.project_costs_sums["OPEX"] + self.project_costs_sums["ABEX"]) / (sum(self.aep_vector)/1e03)
+        self.sLCOE = ((self.project_costs_sums["CAPEX"]*1.1 + self.project_costs_sums["DEVEX"]*1.1) * CRF + self.project_costs_sums["OPEX"] + self.project_costs_sums["ABEX"]) / (sum(self.aep_vector)/1e03)
         # print('LCOE=',self.sLCOE, flush=True)
         
         return self.sLCOE

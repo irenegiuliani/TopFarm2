@@ -252,6 +252,9 @@ class RandomSearchDriver(Driver):
             for name, val in iteritems(self.get_objective_values()):
                 obj = val
                 break
+            
+        print('RS STATUS: ', success)
+        
         return obj, success
 
 

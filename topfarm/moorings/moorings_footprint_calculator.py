@@ -115,23 +115,34 @@ def surf_clipping(surface, beta, alpha, x_t, y_t, mooring_type, n_moorings, plot
             # point at maximum distance from cone vertex, used for calculating max footprint radius
             p_max_d = edges.points[np.argmax(np.linalg.norm(edges.points - vertex, axis=1))]
             max_radius = np.linalg.norm(p_max_d - np.array([x_t, y_t, p_max_d[2]]))
-            
+
         except Exception as e:
             print(f'{e}: error during mooring footprint clipping with bathymetry')
-        
-       
+            vertical_proj, _ = surface.extract_surface().triangulate().clean().ray_trace(vertex, np.array([x_t, y_t, -1000]))
+            surface_fictitious = pv.Disc(center=vertical_proj, inner = 0, outer = 800, normal=(0,0,1), c_res=1000)
+
+            clipped_plane = surface_fictitious.triangulate().clean().clip_surface(cone.triangulate().clean(), invert=True)         # intersection surface between cone and bathymetry
+            
+            edges = clipped_plane.extract_surface().extract_feature_edges(
+                boundary_edges=True, feature_edges=False,
+                non_manifold_edges=False, manifold_edges=False)
+            
+            # point at maximum distance from cone vertex, used for calculating max footprint radius
+            p_max_d = edges.points[np.argmax(np.linalg.norm(edges.points - vertex, axis=1))]
+            max_radius = np.linalg.norm(p_max_d - np.array([x_t, y_t, p_max_d[2]]))
+            
         # find anchoring points
         anchors = []
-        try:
-            for i in range(n_moorings):
-                # for each mooring calculates alpha
-                alpha_rad = np.radians(alpha + (360 / n_moorings) * i)
-                dx = h * np.tan(beta_rad) * np.sin(alpha_rad)
-                dy = h * np.tan(beta_rad) * np.cos(alpha_rad)
-                dz = -h
-                
-                # cone vertex = starting point. For creating a line PyVista needs starting and ending point          
-                end = vertex + np.array([dx, dy, dz])
+        for i in range(n_moorings):
+            # for each mooring calculates alpha
+            alpha_rad = np.radians(alpha + (360 / n_moorings) * i)
+            dx = h * np.tan(beta_rad) * np.sin(alpha_rad)
+            dy = h * np.tan(beta_rad) * np.cos(alpha_rad)
+            dz = -h
+            
+            # cone vertex = starting point. For creating a line PyVista needs starting and ending point          
+            end = vertex + np.array([dx, dy, dz])
+            try:
                 point, _ = surface.extract_surface().triangulate().clean().ray_trace(vertex, end)     # finds intersection between surface (bathymetry) and PyVista line
                 anchor_coords = pv.PolyData(point).points
                 anchor_point = anchor_coords[0]                
@@ -142,12 +153,20 @@ def surf_clipping(surface, beta, alpha, x_t, y_t, mooring_type, n_moorings, plot
                     'mooring_type': mooring_type,
                     'length': length,
                     })
-                   
-            for i in range(n_moorings):
-                try_except=anchors[i]['coords'][0]
-                
-        except Exception as e:
-            print(f'{e}: error during anchoring point clipping with bathymetry')
+            except Exception as e:
+                print(f'{e}: error during anchoring point clipping with bathymetry, tryng with fictitious surface')
+                vertical_proj, _ = surface.extract_surface().triangulate().clean().ray_trace(vertex, np.array([x_t, y_t, -1000]))
+                surface_fictitious = pv.Disc(center=vertical_proj, inner = 0, outer = 800, normal=(0,0,1), c_res=1000)
+                point, _ = surface_fictitious.extract_surface().triangulate().clean().ray_trace(vertex, end)     # finds intersection between surface (bathymetry) and PyVista line
+                anchor_coords = pv.PolyData(point).points
+                anchor_point = anchor_coords[0]                
+                length = np.linalg.norm(anchor_point - vertex)
+                anchors.append({
+                    'name': f'Anchor{i}', 
+                    'coords': anchor_coords, 
+                    'mooring_type': mooring_type,
+                    'length': length,
+                    })
 
 
     if plot:
@@ -227,10 +246,11 @@ def footprint(xarray, shape_crs, wt_x, wt_y, beta, alpha, max_d, resolution_fact
             foot_print.append({'mooring_footprint': edges, 'anchors': anchors, 'max_radius': max_radius})
         
         except Exception as e:           
-            print(f'{e} occurred while clipping bathymetry with max_d')
-            edges, anchors, max_radius = [], [], []
+            print(f'{e} occurred while clipping bathymetry with max_d, turbine is out of bathymetry data')
+            surface = pv.Disc(center=np.array([x, y, -500]), inner = 0, outer = 800, normal=(0,0,1), c_res=1000)
+            edges, anchors, max_radius = surf_clipping(surface, beta, alpha, x, y, mooring_type, n_moorings, plot)
             foot_print.append({'mooring_footprint': edges, 'anchors': anchors, 'max_radius': max_radius})
-        
+            
     return foot_print
 
 
