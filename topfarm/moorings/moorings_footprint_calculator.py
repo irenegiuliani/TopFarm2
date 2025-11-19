@@ -1,275 +1,332 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jul 16 16:04:02 2025
+Refactored and hardened moorings footprint calculator.
 
-@author: Giuliani
+Goals:
+- Remove fragile vector clipping (Shapely/GEOS) in favor of numeric subsetting.
+- Make cone/surface clipping and edge extraction robust to empty/invalid results.
+- Compute anchors by pure geometry (ray vs. footprint edges), avoiding ray_trace where possible.
+- Add clear errors, small helpers, and consistent numpy handling.
+
+Assumptions:
+- Bathymetry is an xarray.DataArray with coords named 'x' and 'y' (monotonic), values are depth z.
+- PyVista is available; functions work in scripts or notebooks.
+
 """
-import sys
-import topfarm
+from __future__ import annotations
+
+import logging
+from typing import Iterable, List, Tuple, Optional
 from topfarm.moorings.seabed_features import seabed_features
 import numpy as np
 import pyvista as pv
 from scipy.interpolate import RegularGridInterpolator
-import geopandas as gpd
-from shapely.geometry import box
-import rioxarray
-from pyproj import CRS
-import miniball
+import xarray as xr  # only for types; keep .rio if present
 
 
 
-def fine_mesh(x, y, z, resolution_factor):
-    
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+LOG = logging.getLogger(__name__)
+if not LOG.handlers:
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+EPS = 1e-12
+
+
+# -----------------------------------------------------------------------------
+# Grid helpers
+# -----------------------------------------------------------------------------
+def subset_rect_da(da: xr.DataArray, x: float, y: float, max_d: float) -> xr.DataArray:
+    """Subset a rectangular window from an xarray.DataArray without Shapely/GEOS.
+
+    Handles both increasing/decreasing coord orders. Raises ValueError on empty.
     """
-    Create a finer meshgrid by interpolating a given 2D surface.
-    
+    if 'x' not in da.coords or 'y' not in da.coords:
+        raise ValueError("DataArray must have 'x' and 'y' coordinates.")
+
+    x0, x1 = x - max_d, x + max_d
+    y0, y1 = y - max_d, y + max_d
+
+    xs = slice(min(x0, x1), max(x0, x1)) if float(da.x[0]) < float(da.x[-1]) else slice(max(x0, x1), min(x0, x1))
+    ys = slice(min(y0, y1), max(y0, y1)) if float(da.y[0]) < float(da.y[-1]) else slice(max(y0, y1), min(y0, y1))
+
+    sub = da.sel(x=xs, y=ys)
+    if sub.x.size == 0 or sub.y.size == 0:
+        raise ValueError("Subset is empty: window lies outside raster extent.")
+    return sub
+
+
+def fine_mesh(x: np.ndarray, y: np.ndarray, z: np.ndarray, resolution_factor: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Create a finer meshgrid by interpolating a given 2D surface.
+
     Parameters
     ----------
-    x : np.ndarray
-        1D array of x coordinates.
-    y : np.ndarray
-        1D array of y coordinates.
-    z : np.ndarray
-        2D array of z values corresponding to the grid defined by x and y.
+    x, y : 1D arrays
+        Grid coordinates. Must be monotonic.
+    z : 2D array
+        Values on (y, x) grid.
     resolution_factor : int
-        Factor by which the resolution of the grid will be increased.
-    
-    Returns
-    -------
-    X_fine : np.ndarray
-        2D array of refined x coordinates (meshgrid).
-    Y_fine : np.ndarray
-        2D array of refined y coordinates (meshgrid).
-    Z_fine : np.ndarray
-        2D array of interpolated z values on the refined grid.
+        Refinement factor (>1 for finer grid).
     """
-    nx, ny = len(x) * resolution_factor, len(y) * resolution_factor
+    if resolution_factor <= 1:
+        X, Y = np.meshgrid(x, y)
+        return X, Y, z
+
+    nx, ny = int(len(x) * resolution_factor), int(len(y) * resolution_factor)
     interp = RegularGridInterpolator((y, x), z, method='linear', bounds_error=False, fill_value=np.nan)
-    x_fine = np.linspace(x.min(), x.max(), nx)
-    y_fine = np.linspace(y.min(), y.max(), ny)
-    X_fine, Y_fine = np.meshgrid(x_fine, y_fine)
-    Z_fine = interp(np.column_stack([Y_fine.ravel(), X_fine.ravel()])).reshape(Y_fine.shape)
-    return X_fine, Y_fine, Z_fine
+    x_f = np.linspace(float(np.min(x)), float(np.max(x)), nx)
+    y_f = np.linspace(float(np.min(y)), float(np.max(y)), ny)
+    Xf, Yf = np.meshgrid(x_f, y_f)
+    Zf = interp(np.column_stack([Yf.ravel(), Xf.ravel()])).reshape(Yf.shape)
+    return Xf, Yf, Zf
 
 
-
-def surf_clipping(surface, beta, alpha, x_t, y_t, mooring_type, n_moorings, plot):
-    
+# -----------------------------------------------------------------------------
+# Geometry helpers (azimuth and ray/segment intersection)
+# -----------------------------------------------------------------------------
+def azimuth_dir_from_north(az_deg: float) -> np.ndarray:
+    """Azimuth from North (clockwise) -> 2D direction vector (dx, dy).
+    0° -> +Y; 90° -> +X; 180° -> -Y; 270° -> -X
     """
-    Generate a conical mooring footprint and compute anchor points on a surface.
-    
-    Parameters
-    ----------
-    surface : pv.StructuredGrid
-        PyVista surface mesh representing bathymetry.
-    beta : float
-        Cone half-angle (degrees) defining the mooring spread.
-    alpha : float
-        Orientation angle of the first mooring (degrees from North).
-    x_t : float
-        X coordinate of the turbine position.
-    y_t : float
-        Y coordinate of the turbine position.
-    mooring_type : str
-        Type of mooring ('taught' supported).
-    n_moorings : int
-        Number of mooring lines to simulate.
-    plot : bool
-        If True, plots the cone, surface, and anchors.
-    
+    a = np.deg2rad(az_deg)
+    return np.array([np.sin(a), np.cos(a)], dtype=float)
+
+
+def cross2d(u: np.ndarray, v: np.ndarray) -> float:
+    return float(u[0]*v[1] - u[1]*v[0])
+
+
+def ray_segment_intersection_xy(Oxy: np.ndarray, r: np.ndarray, Axy: np.ndarray, Bxy: np.ndarray, eps: float = EPS) -> Tuple[Optional[float], Optional[float]]:
+    """Intersect ray (O + t*r, t>=0) with segment [A,B] in XY; return (t,u) or (None,None)."""
+    s = Bxy - Axy
+    rxs = cross2d(r, s)
+    if abs(rxs) < eps:
+        return None, None
+    qp = Axy - Oxy
+    t = cross2d(qp, s) / rxs   # along ray
+    u = cross2d(qp, r) / rxs   # along segment [0,1]
+    if t > eps and 0.0 <= u <= 1.0:
+        return float(t), float(u)
+    return None, None
+
+
+def iter_poly_segments(poly: pv.PolyData):
+    """Yield successive (i0,i1) point indices for each polyline/cell in a PolyData edges object."""
+    arr = np.asarray(poly.lines)
+    if arr.size == 0:
+        # Fallback: use points in order and close
+        idxs = np.arange(poly.n_points)
+        for a, b in zip(idxs, np.roll(idxs, -1)):
+            yield int(a), int(b)
+        return
+
+    i = 0
+    n_tot = arr.size
+    while i < n_tot:
+        n = int(arr[i]); ids = arr[i+1:i+1+n]
+        for k in range(n-1):
+            yield int(ids[k]), int(ids[k+1])
+        i += n + 1
+
+
+# -----------------------------------------------------------------------------
+# Core: surface clipping and anchor computation (geometry only)
+# -----------------------------------------------------------------------------
+
+def surf_clipping(surface: pv.StructuredGrid, beta: float, alpha: float, x_t: float, y_t: float,
+                  mooring_type: str, n_moorings: int, plot: bool) -> Tuple[np.ndarray, List[dict], float]:
+    """Generate a conical mooring footprint and compute anchor points on a surface.
+
     Returns
     -------
-    np.ndarray
-        Coordinates of the edge points of the clipped cone.
-    list of dict
-        Anchor definitions with keys: 'name', 'coords', and 'mooring_type'.
+    edges_pts : (M,3) array of edge coordinates (footprint boundary)
+    anchors : list[dict]
+    max_radius : float
     """
-    
-    # if mooring_type == 'catenary':
-    #     anchors = []
-        
     if mooring_type != 'taught':
-        print('Only "taught" type implemented for now')
-        return None, None
-    
-    if mooring_type == 'taught':
-        beta_rad = np.radians(beta)
-        
+        raise ValueError('Only "taught" mooring_type is implemented')
+
+    beta_rad = np.deg2rad(beta)
+    vertex = np.array([float(x_t), float(y_t), 0.0])
+
+    # Robust cone dimensions
+    if surface.n_points == 0:
+        raise ValueError("Surface has no points.")
+    min_z = float(np.nanmin(surface.points[:, 2]))
+    # height of cone equals |min depth| + margin to ensure it crosses bathymetry
+    h = abs(min_z) + 800.0
+    r = h * np.tan(beta_rad)
+
+    # Build cone (upwards), then clip bathymetry by cone volume
+    direction = np.array([0.0, 0.0, 1.0])
+    center = vertex - direction * (h / 2.0)
+    try:
+        cone = pv.Cone(center=center, direction=direction, height=h, radius=r, resolution=400, capping=True)
+        # Triangulate/clean once
+        surf_tri = surface.extract_surface().triangulate().clean()
+        cone_tri = cone.triangulate().clean()
+        clipped = surf_tri.clip_surface(cone_tri, invert=True)
+        if clipped.n_points == 0:
+            raise RuntimeError("Empty clipped surface (bathymetry outside cone).")
+        edges = clipped.extract_surface().extract_feature_edges(boundary_edges=True, feature_edges=False,
+                                                               non_manifold_edges=False, manifold_edges=False)
+        if edges.n_points == 0:
+            raise RuntimeError("No boundary edges extracted from clipped surface.")
+
+        # Max footprint radius
+        diffs = edges.points - vertex
+        p_max = edges.points[np.argmax(np.linalg.norm(diffs, axis=1))]
+        max_radius = float(np.linalg.norm(p_max - np.array([x_t, y_t, p_max[2]])))
+    except Exception as e:
+        LOG.warning(f"%s: falling back to fictitious flat disc for footprint.", e)
+        # Fallback: flat disc at projected bathymetry
+        vertical_end = np.array([x_t, y_t, -1000.0])
         try:
-            # height of cone equal to max bathymetry plus offset (1000 m) for PyVista scale problem
-            h = abs(np.min(surface.points[:, 2])) + 800
-            r = h * np.tan(beta_rad)
-            vertex = np.array([x_t, y_t, 0])
-            direction = np.array([0, 0, 1])
-            center = vertex - direction * (h / 2)
-        
-            cone = pv.Cone(center=center.tolist(), direction=direction.tolist(),
-                           height=h, radius=r, resolution=350, capping=True) #300
-                    
-            clipped_plane = surface.triangulate().clean().clip_surface(cone.triangulate().clean(), invert=True)         # intersection surface between cone and bathymetry
-            
-            edges = clipped_plane.extract_surface().extract_feature_edges(
-                boundary_edges=True, feature_edges=False,
-                non_manifold_edges=False, manifold_edges=False)
-            
-            # point at maximum distance from cone vertex, used for calculating max footprint radius
-            p_max_d = edges.points[np.argmax(np.linalg.norm(edges.points - vertex, axis=1))]
-            max_radius = np.linalg.norm(p_max_d - np.array([x_t, y_t, p_max_d[2]]))
+            pt, _ = surf_tri.ray_trace(vertex, vertical_end)
+            center_disc = np.asarray(pt).reshape(-1, 3)[0]
+        except Exception:
+            center_disc = np.array([x_t, y_t, min_z])
+        surface_fict = pv.Disc(center=center_disc, inner=0.0, outer=800.0, normal=(0, 0, 1), c_res=720)
+        clipped = surface_fict.triangulate().clean().clip_surface(cone_tri, invert=True)
+        edges = clipped.extract_surface().extract_feature_edges(boundary_edges=True, feature_edges=False,
+                                                               non_manifold_edges=False, manifold_edges=False)
+        if edges.n_points == 0:
+            raise RuntimeError("Fallback disc produced no edges; cannot compute footprint.")
+        diffs = edges.points - vertex
+        p_max = edges.points[np.argmax(np.linalg.norm(diffs, axis=1))]
+        max_radius = float(np.linalg.norm(p_max - np.array([x_t, y_t, p_max[2]])))
 
-        except Exception as e:
-            print(f'{e}: error during mooring footprint clipping with bathymetry')
-            vertical_proj, _ = surface.extract_surface().triangulate().clean().ray_trace(vertex, np.array([x_t, y_t, -1000]))
-            surface_fictitious = pv.Disc(center=vertical_proj, inner = 0, outer = 800, normal=(0,0,1), c_res=1000)
+    # ----------------- Anchors by geometry only (no ray_trace) -----------------
+    anchors: List[dict] = []
+    O = vertex.copy()
+    Oxy = O[:2]
 
-            clipped_plane = surface_fictitious.triangulate().clean().clip_surface(cone.triangulate().clean(), invert=True)         # intersection surface between cone and bathymetry
-            
-            edges = clipped_plane.extract_surface().extract_feature_edges(
-                boundary_edges=True, feature_edges=False,
-                non_manifold_edges=False, manifold_edges=False)
-            
-            # point at maximum distance from cone vertex, used for calculating max footprint radius
-            p_max_d = edges.points[np.argmax(np.linalg.norm(edges.points - vertex, axis=1))]
-            max_radius = np.linalg.norm(p_max_d - np.array([x_t, y_t, p_max_d[2]]))
-            
-        # find anchoring points
-        anchors = []
-        for i in range(n_moorings):
-            # for each mooring calculates alpha
-            alpha_rad = np.radians(alpha + (360 / n_moorings) * i)
-            dx = h * np.tan(beta_rad) * np.sin(alpha_rad)
-            dy = h * np.tan(beta_rad) * np.cos(alpha_rad)
-            dz = -h
-            
-            # cone vertex = starting point. For creating a line PyVista needs starting and ending point          
-            end = vertex + np.array([dx, dy, dz])
-            try:
-                point, _ = surface.extract_surface().triangulate().clean().ray_trace(vertex, end)     # finds intersection between surface (bathymetry) and PyVista line
-                anchor_coords = pv.PolyData(point).points
-                anchor_point = anchor_coords[0]                
-                length = np.linalg.norm(anchor_point - vertex)
-                anchors.append({
-                    'name': f'Anchor{i}', 
-                    'coords': anchor_coords, 
-                    'mooring_type': mooring_type,
-                    'length': length,
-                    })
-            except Exception as e:
-                print(f'{e}: error during anchoring point clipping with bathymetry, tryng with fictitious surface')
-                vertical_proj, _ = surface.extract_surface().triangulate().clean().ray_trace(vertex, np.array([x_t, y_t, -1000]))
-                surface_fictitious = pv.Disc(center=vertical_proj, inner = 0, outer = 800, normal=(0,0,1), c_res=1000)
-                point, _ = surface_fictitious.extract_surface().triangulate().clean().ray_trace(vertex, end)     # finds intersection between surface (bathymetry) and PyVista line
-                anchor_coords = pv.PolyData(point).points
-                anchor_point = anchor_coords[0]                
-                length = np.linalg.norm(anchor_point - vertex)
-                anchors.append({
-                    'name': f'Anchor{i}', 
-                    'coords': anchor_coords, 
-                    'mooring_type': mooring_type,
-                    'length': length,
-                    })
+    def pick_anchor_for_az(az_deg: float) -> np.ndarray:
+        r_dir = azimuth_dir_from_north(az_deg)
+        best_t = np.inf
+        best_point = None
+        for i0, i1 in iter_poly_segments(edges):
+            A = edges.points[i0]
+            B = edges.points[i1]
+            t, u = ray_segment_intersection_xy(Oxy, r_dir, A[:2], B[:2])
+            if t is None:
+                continue
+            if t < best_t:
+                best_t = t
+                xy = Oxy + t * r_dir
+                z = (1.0 - u) * A[2] + u * B[2]
+                best_point = np.array([xy[0], xy[1], z], dtype=float)
+        if best_point is None:
+            # Fallback: pick the edge vertex with closest azimuth
+            V = edges.points[:, :2] - Oxy
+            ang = np.arctan2(V[:, 0], V[:, 1])  # azimuth from North
+            az = np.deg2rad(az_deg)
+            diff = np.abs((ang - az + np.pi) % (2*np.pi) - np.pi)
+            idx = int(np.argmin(diff))
+            best_point = edges.points[idx]
+        return best_point
 
+    for k in range(n_moorings):
+        az_k = float(alpha + (360.0 / n_moorings) * k)
+        p = pick_anchor_for_az(az_k)
+        length = float(np.linalg.norm(p - O))
+        anchors.append({
+            'name': f'Anchor{k}',
+            'coords': np.asarray([p], float),
+            'mooring_type': mooring_type,
+            'length': length,
+        })
 
     if plot:
-        plotter = pv.Plotter()
-        plotter.add_mesh(surface, show_edges=True, color='lightblue', )
-        plotter.add_mesh(cone, show_edges=True, color='red', opacity=0.7)
-        plotter.add_mesh(clipped_plane, show_edges=True, color='blue')
-        plotter.show()
+        try:
+            plotter = pv.Plotter()
+            plotter.add_mesh(surface, show_edges=True, color='lightblue')
+            plotter.add_mesh(clipped, color='white', opacity=0.25)
+            plotter.add_mesh(pv.PolyData(edges.points), color='navy')
+            plotter.add_mesh(pv.Sphere(radius=10.0, center=vertex), color='red')
+            for a in anchors:
+                plotter.add_mesh(pv.Sphere(radius=10.0, center=a['coords'][0]), color='orange')
+            plotter.show()
+        except Exception as e:
+            LOG.warning("Plotting failed: %s", e)
 
-    return edges.points, anchors, max_radius
+    return edges.points.copy(), anchors, max_radius
 
 
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 
-def footprint(xarray, shape_crs, wt_x, wt_y, beta, alpha, max_d, resolution_factor, mooring_type, n_moorings, plot):
-    """
-    Generate the mooring footprint and anchors for a set of turbine positions.
-    
+def footprint(da: xr.DataArray, shape_crs, wt_x: Iterable[float], wt_y: Iterable[float],
+              beta: float, alpha: float, max_d: float, resolution_factor: int,
+              mooring_type: str, n_moorings: int, plot: bool):
+    """Generate mooring footprints and anchors for given turbine positions.
+
     Parameters
     ----------
-    xarray : xarray.DataArray
-        Bathymetric raster data.
+    da : xarray.DataArray
+        Bathymetric raster (coords 'x', 'y').
     shape_crs : CRS
-        Coordinate reference system of the site boundary.
-    wt_x : array-like
-        X coordinates of the wind turbines.
-    wt_y : array-like
-        Y coordinates of the wind turbines.
-    beta : float
-        Cone spread angle for mooring lines.
-    alpha : float
-        Initial angle orientation (degrees).
+        Unused here; kept for API compatibility.
+    wt_x, wt_y : arrays
+        Turbine XY coordinates.
+    beta, alpha : floats
+        Cone half-angle (deg) and initial azimuth (deg from North).
     max_d : float
-        Maximum distance to clip raster around each turbine.
+        Half-size of clipping window around each turbine (same units as x/y).
     resolution_factor : int
-        Factor for increasing grid resolution.
+        >1 to refine grid via interpolation.
     mooring_type : str
-        Type of mooring ('taught' supported).
+        Only 'taught' supported.
     n_moorings : int
         Number of mooring lines per turbine.
     plot : bool
-        If True, plot each step for visualization.
-    
-    Returns
-    -------
-    list of dict
-        Each item contains:
-            - 'mooring_footprint': array of clipped surface points.
-            - 'anchors': list of anchor dictionaries for each turbine.
+        Plot intermediate results with PyVista.
     """
-    
-    foot_print = []
-    
+    foot_print: List[dict] = []
+
+    # Validate coords
+    if 'x' not in da.coords or 'y' not in da.coords:
+        raise ValueError("DataArray must have 'x' and 'y' coordinates.")
+
     for x, y in zip(wt_x, wt_y):
-        rect = box(x - max_d, y - max_d, x + max_d, y + max_d)
-        rect_gdf = gpd.GeoDataFrame({'geometry': [rect]}, crs=shape_crs)
-
         try:
-            clipped = xarray.rio.clip(rect_gdf.geometry, rect_gdf.crs, drop=True)
-            # clipped = xarray.rio.clip_box(  minx=x - max_d,
-            #                                 miny=y - max_d,
-            #                                 maxx=x + max_d,
-            #                                 maxy=y + max_d,
-            #                                 crs=shape_crs,
-            #                             )
-            
-            # interpolating if required for higher resolution 
-            if resolution_factor != 1:
-                X_fine, Y_fine, Z_fine = fine_mesh(clipped.x.data, clipped.y.data, clipped.data, resolution_factor)
-                surface = pv.StructuredGrid(X_fine, Y_fine, Z_fine)
+            clipped = subset_rect_da(da, float(x), float(y), float(max_d))
 
+            # Interpolate if requested
+            X, Y = np.meshgrid(clipped.x.data, clipped.y.data)
+            if int(resolution_factor) != 1:
+                X, Y, Z = fine_mesh(clipped.x.data, clipped.y.data, np.asarray(clipped.data), int(resolution_factor))
             else:
-                X, Y =np.meshgrid(clipped.x.data, clipped.y.data)
-                surface = pv.StructuredGrid(X, Y, clipped.data)
-                
-            # calling clipping function
-            edges, anchors, max_radius = surf_clipping(surface, beta, alpha, x, y, mooring_type, n_moorings, plot)
+                Z = np.asarray(clipped.data)
+
+            surface = pv.StructuredGrid(np.ascontiguousarray(X), np.ascontiguousarray(Y), np.ascontiguousarray(Z))
+
+            edges, anchors, max_radius = surf_clipping(surface, beta, alpha, float(x), float(y), mooring_type, int(n_moorings), plot)
             foot_print.append({'mooring_footprint': edges, 'anchors': anchors, 'max_radius': max_radius})
-        
-        except Exception as e:           
-            print(f'{e} occurred while clipping bathymetry with max_d, turbine is out of bathymetry data')
-            surface = pv.Disc(center=np.array([x, y, -500]), inner = 0, outer = 800, normal=(0,0,1), c_res=1000)
-            edges, anchors, max_radius = surf_clipping(surface, beta, alpha, x, y, mooring_type, n_moorings, plot)
+
+        except Exception as e:
+            LOG.warning("%s occurred while creating footprint; using fictitious surface.", e)
+            # Fallback: flat disc at arbitrary depth
+            surface = pv.Disc(center=np.array([x, y, -500.0]), inner=0.0, outer=800.0, normal=(0, 0, 1), c_res=720)
+            edges, anchors, max_radius = surf_clipping(surface, beta, alpha, float(x), float(y), mooring_type, int(n_moorings), plot)
             foot_print.append({'mooring_footprint': edges, 'anchors': anchors, 'max_radius': max_radius})
-            
+
     return foot_print
 
 
-
+# Example wrapper preserved (adapt to your project environment)
 def moorings_footprint(x, y, site, beta, resolution_factor, max_d, mooring_type, n_moorings, plot):
-    
     # finds wd with higher frequency
     alpha = site.ds.Sector_frequency.wd.data[np.argmax(site.ds.Sector_frequency.data)]
-    plot=False
-    return seabed_features(site, footprint(site.water_depth, site.bounds_shape.crs,           
-                                             np.array(x),            # wt_x
-                                             np.array(y),            # wt_y
-                                             beta, alpha, max_d, resolution_factor,
-                                             mooring_type, n_moorings, plot))
-
-
-
-    
-    
-    
-    
-    
+    return seabed_features(
+        site,
+        footprint(site.water_depth, site.bounds_shape.crs, np.array(x), np.array(y), beta, alpha,
+                  max_d, resolution_factor, mooring_type, n_moorings, plot),
+        label_col='seabed',          # opzionale; autodetect se mancante
+        default_value='Nodata',      # etichetta per punti non assegnati
+        repair_geometries=True,      # ripara poligoni invalsi
+        prefer_within_then_intersects=True
+    )

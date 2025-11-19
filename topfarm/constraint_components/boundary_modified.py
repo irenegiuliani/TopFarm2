@@ -107,8 +107,8 @@ class XYBoundaryConstraint(Constraint):
         self.boundary_comp = self.get_comp(n_wt)
         self.boundary_comp.problem = problem
         self.set_design_var_limits(problem.design_vars)
-        problem.indeps.add_output('xy_boundary', self.boundary_comp.xy_boundary)
-        getattr(problem.model, group).add_subsystem('xy_bound_comp', self.boundary_comp, promotes=['*'])
+        problem.indeps.add_output(f'xy_boundary_{self.x_key}', self.boundary_comp.xy_boundary)
+        getattr(problem.model, group).add_subsystem(f'xy_bound_comp_{self.x_key}', self.boundary_comp, promotes=['*'])
 
 
     def setup_as_constraint(self, problem, group='constraint_group'):
@@ -117,7 +117,7 @@ class XYBoundaryConstraint(Constraint):
             lower = 0
         else:
             lower = self.boundary_comp.zeros
-        problem.model.add_constraint('boundaryDistances', lower=lower)
+        problem.model.add_constraint(f'boundaryDistances_{self.x_key}', lower=lower)
 
     def setup_as_penalty(self, problem, group='constraint_group'):
         self._setup(problem, group=group)
@@ -182,13 +182,13 @@ class BoundaryBaseComp(ConstraintComponent):
         # self.add_output('constraint_violation_' + self.const_id, val=0.0)
         # Explicitly size output array
         # (vector with positive elements if turbines outside of hull)
-        self.add_output('boundaryDistances', self.zeros,
+        self.add_output(f'boundaryDistances_{self.x_key}', self.zeros,
                         desc="signed perpendicular distances from each turbine to each face CCW; + is inside")
-        self.declare_partials('boundaryDistances', [self.x_key, self.y_key])
+        self.declare_partials(f'boundaryDistances_{self.x_key}', [self.x_key, self.y_key])
         if self.relaxation:
-            self.declare_partials('boundaryDistances', 'time')
+            self.declare_partials(f'boundaryDistances_{self.x_key}', 'time')
 
-        # self.declare_partials('boundaryDistances', ['boundaryVertices', 'boundaryNormals'], method='fd')
+        # self.declare_partials(f'boundaryDistances_{self.x_key}', ['boundaryVertices', 'boundaryNormals'], method='fd')
 
     def compute(self, inputs, outputs):
         # calculate distances from each point to each face
@@ -197,7 +197,7 @@ class BoundaryBaseComp(ConstraintComponent):
         y = inputs[self.y_key]
         boundaryDistances = self.distances(x=x, y=y)
         # boundaryDistances = self.distances(**args)
-        outputs['boundaryDistances'] = boundaryDistances
+        outputs[f'boundaryDistances_{self.x_key}'] = boundaryDistances
         # outputs['constraint_violation_' + self.const_id] = np.sum(np.minimum(boundaryDistances, 0) ** 2)
 
     def compute_partials(self, inputs, partials):
@@ -207,10 +207,10 @@ class BoundaryBaseComp(ConstraintComponent):
         else:
             dx, dy, dt = self.gradients(**{xy: inputs[k] for xy, k in zip('xy', [self.x_key, self.y_key])})
 
-        partials['boundaryDistances', self.x_key] = dx
-        partials['boundaryDistances', self.y_key] = dy
+        partials[f'boundaryDistances_{self.x_key}', self.x_key] = dx
+        partials[f'boundaryDistances_{self.x_key}', self.y_key] = dy
         if self.relaxation:
-            partials['boundaryDistances', 'time'] = dt
+            partials[f'boundaryDistances_{self.x_key}', 'time'] = dt
 
     def plot(self, ax):
         """Plot boundary"""

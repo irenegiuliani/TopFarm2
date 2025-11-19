@@ -100,6 +100,7 @@ class economic_evaluation():
         pit_moment = np.array(Pitching_moment)
         moorings_cost=np.array(moorings_cost)
         anchoring_cost=np.array(anchoring_cost)
+        n_wt=len(rated_power)
         
         self.calculate_turbine(rated_rpm, rotor_diameter, rated_power, hub_height)
         self.calculate_foundation(pit_moment, moorings_cost, anchoring_cost)
@@ -181,7 +182,7 @@ class economic_evaluation():
         rated_torque = rated_power / (rated_rpm * np.pi / 30.0) * 1.1
         rotor_area = np.pi * (rotor_diameter / 2) ** 2
         tower_length= rotor_diameter / 2 + 30 - 20
-
+        n_wt = len(rated_power)
 
         # %% Blades
 
@@ -334,7 +335,7 @@ class economic_evaluation():
 
         # self.turbine_general_costs_sums["TOTAL"] = self.turbine_general_costs_sums["total_production"] + \
         #     self.turbine_general_costs_sums["project"]
-        self.turbine_general_costs_sums["TOTAL"] = np.array([23000000] * 39)
+        self.turbine_general_costs_sums["TOTAL"] = np.array([23000000] * n_wt)
 
 
     # %% Foundation        
@@ -346,14 +347,14 @@ class economic_evaluation():
         self.foundation_costs = {}
         self.foundation_general_costs = {}
         self.foundation_general_costs_sums = {}
-
+        n_wt = len(pit_moment)
 
         self.foundation_mass = {
             "semi_sub": 0.00875674 * pit_moment -1157984.95823864}
 
         self.foundation_costs = {
             # "semi_sub": 2.14308834 * self.foundation_mass['semi_sub'] + 7689597.24562343}
-            "semi_sub": np.array([28000000] * 39) }
+            "semi_sub": np.array([28000000] * n_wt) }
                 
         self.foundation_mass_sum = sum(self.foundation_mass.values())
         self.foundation_cost_sum = sum(self.foundation_costs.values())

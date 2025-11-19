@@ -34,7 +34,6 @@ BASE_COLORS = [
 ]
 # fmt:on
 
-
 class XYPlotComp(ExplicitComponent):
     """Plotting component for turbine locations"""
     colors = BASE_COLORS * (2000 // len(BASE_COLORS) + 1)  # ~2000 colors delay tech-debt
